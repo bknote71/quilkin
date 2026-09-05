@@ -24,7 +24,7 @@ use std::{
         Arc,
         atomic::{AtomicU16, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 /// Wrapper around the actual packet buffer and the UDP metadata it parsed to
@@ -366,6 +366,24 @@ impl PortMap {
         }
     }
 
+    /// Releases the slot for the given port, so [`PortMap::get`] no longer
+    /// resolves it to a (now stale) client address.
+    #[inline]
+    fn clear(&mut self, port: NetworkU16) {
+        let Some(i) = port.host().checked_sub(EPHEMERAL_RANGE_END) else {
+            return;
+        };
+        let i = i as usize;
+        let bucket = i / BUCKET_SIZE;
+
+        if let Some(bucket) = self.buckets.get_mut(bucket) {
+            // SAFETY: We know the index is valid
+            unsafe {
+                bucket.get_unchecked_mut(i % BUCKET_SIZE).port = 0;
+            }
+        }
+    }
+
     #[inline]
     fn insert(&mut self, client_addr: SocketAddr, port: u16) {
         let i = (port - EPHEMERAL_RANGE_END) as usize;
@@ -389,6 +407,11 @@ impl PortMap {
 struct ClientInfo {
     asn_info: Option<IpNetEntry>,
     created_at: Instant,
+    /// The last time a packet was seen from this client. Used to reap idle
+    /// clients, since [`PortMapper`] otherwise only ever expires as a whole
+    /// (see [`SessionState::get_or_create`]), which for a server that keeps
+    /// receiving traffic effectively never happens.
+    last_seen: Instant,
     /// The port used to identify this unique session to the IP owning this map
     port: NetworkU16,
     /// Interarrival jitter of this session, folded into aggregate metrics by
@@ -396,10 +419,26 @@ struct ClientInfo {
     quality: session_quality::SessionQualityHandle,
 }
 
+/// How long a client can go without sending a packet before it's considered
+/// gone and its slot is reclaimed. Mirrors the default idle timeout used by
+/// [`crate::collections::ttl::TtlMap`], which the non-XDP session path relies
+/// on for the equivalent per-client expiry.
+const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How often [`PortMapper::get_or_alloc`] sweeps for idle clients. This runs
+/// on the packet-processing hot path, so it's throttled to an interval rather
+/// than checked on every call.
+const CLIENT_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
+
+#[derive(Default)]
+struct ClientMap {
+    clients: std::collections::HashMap<SocketAddr, ClientInfo>,
+    last_swept: Option<Instant>,
+}
+
 struct PortMapper {
     /// Maps a client endpoint to the port used as the source port for sending
     /// to the server endpoint `Self` is associated with
-    client_to_port: Arc<parking_lot::Mutex<std::collections::HashMap<SocketAddr, ClientInfo>>>,
+    client_to_port: Arc<parking_lot::Mutex<ClientMap>>,
     port_to_client: Arc<parking_lot::RwLock<PortMap>>,
     /// The cluster the server endpoint this maps to belongs to, as routing
     /// reported it when the first session to that endpoint was created. Held here
@@ -419,15 +458,49 @@ impl PortMapper {
         }
     }
 
+    /// Removes clients that haven't been seen in [`CLIENT_IDLE_TIMEOUT`],
+    /// releasing their metrics and reverse-mapping slot. Throttled to run at
+    /// most once per [`CLIENT_SWEEP_INTERVAL`], since this is called from the
+    /// packet-processing hot path.
+    #[inline]
+    fn sweep_idle_clients(&self, state: &mut ClientMap, now: Instant) {
+        let is_due = state
+            .last_swept
+            .is_none_or(|last| now.duration_since(last) >= CLIENT_SWEEP_INTERVAL);
+        if !is_due {
+            return;
+        }
+        state.last_swept = Some(now);
+
+        let port_to_client = &self.port_to_client;
+        state.clients.retain(|_, client| {
+            let idle = now.duration_since(client.last_seen) >= CLIENT_IDLE_TIMEOUT;
+            if idle {
+                session_metrics::active_sessions(client.asn_info.as_ref()).dec();
+                session_metrics::sessions_closed_total(session_metrics::CloseReason::IdleTimeout)
+                    .inc();
+                session_metrics::duration_secs()
+                    .observe(now.duration_since(client.created_at).as_secs_f64());
+                port_to_client.write().clear(client.port);
+            }
+            !idle
+        });
+    }
+
     #[inline]
     fn get_or_alloc(
         &self,
         client_addr: SocketAddr,
         asn: Option<&IpNetEntry>,
     ) -> Option<NetworkU16> {
-        match self.client_to_port.lock().entry(client_addr) {
-            Entry::Occupied(entry) => {
-                let client = entry.get();
+        let now = Instant::now();
+        let mut state = self.client_to_port.lock();
+        self.sweep_idle_clients(&mut state, now);
+
+        match state.clients.entry(client_addr) {
+            Entry::Occupied(mut entry) => {
+                let client = entry.get_mut();
+                client.last_seen = now;
                 client.quality.record_arrival();
                 Some(client.port)
             }
@@ -448,7 +521,8 @@ impl PortMapper {
                 entry.insert(ClientInfo {
                     quality: session_quality::SessionQualityHandle::register(asn),
                     asn_info: asn.cloned(),
-                    created_at: Instant::now(),
+                    created_at: now,
+                    last_seen: now,
                     port,
                 });
                 Some(port)
@@ -468,7 +542,7 @@ impl Drop for PortMapper {
 
         let now = Instant::now();
 
-        for client_info in lock.values() {
+        for client_info in lock.clients.values() {
             session_metrics::active_sessions(client_info.asn_info.as_ref()).dec();
             session_metrics::sessions_closed_total(session_metrics::CloseReason::IdleTimeout).inc();
             session_metrics::duration_secs()
@@ -1028,6 +1102,56 @@ mod test {
     use super::*;
     use quilkin_xdp::xdp::packet::Pod;
     use xdp::packet::net_types as nt;
+
+    // Regression test for https://github.com/EmbarkStudios/quilkin/issues/1394:
+    // a client that goes idle on a `PortMapper` that keeps seeing traffic from
+    // *other* clients must still be individually reaped, rather than only
+    // ever being cleared out when the whole `PortMapper` (i.e. every client
+    // ever seen for that server) is torn down.
+    #[test]
+    fn port_mapper_evicts_idle_clients_individually() {
+        let mapper = PortMapper::new("test-cluster");
+        let idle_client: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let active_client: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        let t0 = Instant::now();
+        let idle_port = mapper.get_or_alloc(idle_client, None).unwrap();
+        let active_port = mapper.get_or_alloc(active_client, None).unwrap();
+        assert_eq!(mapper.client_to_port.lock().clients.len(), 2);
+
+        // Far enough past both the sweep interval and the idle timeout that a
+        // sweep will run and `idle_client` (last seen at t0) qualifies for
+        // eviction, but `active_client` keeps refreshing its own `last_seen`
+        // by continuing to "send packets" via `get_or_alloc`.
+        let t1 = t0 + CLIENT_IDLE_TIMEOUT + CLIENT_SWEEP_INTERVAL + Duration::from_secs(1);
+        {
+            let mut state = mapper.client_to_port.lock();
+            state.clients.get_mut(&active_client).unwrap().last_seen = t1;
+            mapper.sweep_idle_clients(&mut state, t1);
+        }
+
+        let remaining = mapper.client_to_port.lock();
+        assert!(
+            !remaining.clients.contains_key(&idle_client),
+            "idle client should have been reaped"
+        );
+        assert!(
+            remaining.clients.contains_key(&active_client),
+            "active client should not have been reaped"
+        );
+        drop(remaining);
+
+        assert_eq!(
+            mapper.get_client(idle_port),
+            None,
+            "reaped client's port mapping should be cleared so it doesn't resolve to a stale address"
+        );
+        assert_eq!(
+            mapper.get_client(active_port),
+            Some(active_client),
+            "active client's port mapping must be unaffected"
+        );
+    }
 
     #[test]
     fn asn_cache_evicts_idle_entries() {
