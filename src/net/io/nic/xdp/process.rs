@@ -13,7 +13,7 @@ use quilkin_xdp::xdp::{
     Umem,
     packet::{
         Packet, PacketError, csum,
-        net_types::{IpAddresses, NetworkU16, UdpHdr, UdpHeaders},
+        net_types::{EthHdr, IpAddresses, MacAddress, NetworkU16, UdpHdr, UdpHeaders},
     },
     slab::{HeapSlab, Slab},
 };
@@ -131,6 +131,7 @@ impl filters::PacketMut for PacketWrapper {
     }
 }
 
+use super::next_hop;
 use crate::config;
 
 #[derive(Clone)]
@@ -213,28 +214,30 @@ pub struct State {
     pub sessions: Arc<SessionState>,
     pub local_ipv4: std::net::Ipv4Addr,
     pub local_ipv6: std::net::Ipv6Addr,
+    pub local_mac: MacAddress,
+    /// `None` falls back to replying along the path a frame was received on
+    pub next_hops: Option<next_hop::NextHopCache<next_hop::Netlink>>,
     pub last_receive: UtcTimestamp,
 }
 
 impl State {
-    /// Maps a remote server (upstream) endpoint back to the client endpoint
-    /// that initiated the session
+    /// Until the next hop is resolved the frame is sent back the way the
+    /// received one came, which is only right when that neighbor forwards both ways
     #[inline]
-    fn lookup_client(
-        &self,
-        server_addr: SocketAddr,
-        port: NetworkU16,
-    ) -> Option<(SocketAddr, AsnInfo<'_>, Arc<str>)> {
-        let (addr, cluster) = self.sessions.lookup_client(server_addr, port)?;
-        let entry = self
-            .addr_to_asn
-            .get(&addr.ip(), self.last_receive.unix_nanos())
-            .map_or(metrics::EMPTY, |(ipe, asn)| AsnInfo {
-                prefix: &ipe.prefix,
-                asn: asn.as_str(),
-            });
-
-        Some((addr, entry, cluster))
+    fn eth(&mut self, received: &EthHdr, destination: IpAddr) -> EthHdr {
+        let next_hop = self
+            .next_hops
+            .as_mut()
+            .and_then(|cache| cache.lookup(destination, self.last_receive.unix_nanos()));
+        let Some(mac) = next_hop else {
+            metrics::xdp_next_hop_unresolved().inc();
+            return received.swapped();
+        };
+        EthHdr {
+            destination: mac,
+            source: self.local_mac,
+            ether_type: received.ether_type,
+        }
     }
 
     /// Retrieves or creates a session, ie a mapping of a server endpoint + port
@@ -778,7 +781,7 @@ fn process_client_packet(
     let data_checksum = csum::DataChecksum::calculate_if_needed(data, &packet.buffer);
     let data_length = data.len();
 
-    let eth = packet.headers.eth.swapped();
+    let received_eth = packet.headers.eth;
 
     // If we have more than 1 destination we need to clone the packet data to
     // a new packet for each destination, only modifying the headers
@@ -788,6 +791,7 @@ fn process_client_packet(
                 continue;
             };
             let cluster = daddr.cluster_label();
+            let eth = state.eth(&received_eth, dest_addr.ip());
             let (source, asn, ips) = state.session(source_addr, dest_addr, cluster);
 
             let mut headers = UdpHeaders {
@@ -829,6 +833,7 @@ fn process_client_packet(
     let Ok(dest_addr) = dest_addr.address.to_socket_addr() else {
         return Ok(Some(packet.buffer));
     };
+    let eth = state.eth(&received_eth, dest_addr.ip());
     let (source, asn, ips) = state.session(source_addr, dest_addr, cluster);
 
     let mut headers = UdpHeaders {
@@ -873,12 +878,22 @@ fn process_server_packet(
     let mut server_addr = packet.headers.source_address();
     server_addr.set_ip(server_addr.ip().to_canonical());
 
-    let Some((client_addr, asn, cluster)) =
-        state.lookup_client(server_addr, packet.headers.udp.destination)
+    let Some((client_addr, cluster)) = state
+        .sessions
+        .lookup_client(server_addr, packet.headers.udp.destination)
     else {
         tracing::debug!(address = %server_addr, "received traffic from a server that has no downstream");
         return Ok(Some(packet.buffer));
     };
+
+    let eth = state.eth(&packet.headers.eth, client_addr.ip());
+    let asn = state
+        .addr_to_asn
+        .get(&client_addr.ip(), state.last_receive.unix_nanos())
+        .map_or(metrics::EMPTY, |(ipe, asn)| AsnInfo {
+            prefix: &ipe.prefix,
+            asn: asn.as_str(),
+        });
 
     metrics::set_packet_jitter(metrics::Direction::Write, &asn, jitter);
 
@@ -888,7 +903,7 @@ fn process_server_packet(
     let mut packet = filtered(result, ctx.contents)?;
 
     let mut headers = UdpHeaders {
-        eth: packet.headers.eth.swapped(),
+        eth,
         ip: state.ips(client_addr.ip()).with_header(&packet.headers.ip),
         udp: UdpHdr {
             source: state.external_port,
