@@ -340,24 +340,7 @@ mod netlink {
                 if fd < 0 {
                     return Err(io::Error::last_os_error());
                 }
-                let fd = OwnedFd::from_raw_fd(fd);
-
-                // Bounds how long a worker can stall on a reply
-                let timeout = libc::timeval {
-                    tv_sec: 0,
-                    tv_usec: 500_000,
-                };
-                if libc::setsockopt(
-                    fd.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    libc::SO_RCVTIMEO,
-                    (&timeout as *const libc::timeval).cast(),
-                    std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-                ) != 0
-                {
-                    return Err(io::Error::last_os_error());
-                }
-                fd
+                OwnedFd::from_raw_fd(fd)
             };
 
             Ok(Self {
@@ -367,7 +350,9 @@ mod netlink {
             })
         }
 
-        /// Returns the payload of every reply to one request
+        /// Returns the payload of every reply to one request. Replies are
+        /// produced synchronously by the send and receive calls, so a worker
+        /// never waits on the socket
         fn request(&mut self, kind: u16, flags: u16, body: &[u8]) -> io::Result<Vec<Vec<u8>>> {
             self.seq = self.seq.wrapping_add(1);
 
@@ -394,7 +379,7 @@ mod netlink {
                         self.fd.as_raw_fd(),
                         self.buf.as_mut_ptr().cast(),
                         self.buf.len(),
-                        0,
+                        libc::MSG_DONTWAIT,
                     )
                 };
                 if received < 0 {
