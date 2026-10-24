@@ -1,10 +1,16 @@
 //! Next hop MACs for frames sent through `AF_XDP`, which bypasses the kernel's
 //! neighbor resolution. They are read from the kernel's routing and neighbor
 //! tables over rtnetlink, and the kernel is asked to resolve the ones it hasn't,
-//! as nothing else on this path would trigger ARP or NDP for them.
+//! as nothing else on this path would trigger ARP or NDP for them. Until a next
+//! hop resolves its frames are sent through the kernel's own stack instead.
 
-use quilkin_xdp::xdp::packet::net_types::MacAddress;
-use std::{collections::HashMap, io, net::IpAddr};
+use quilkin_xdp::xdp::packet::net_types::{EthHdr, MacAddress};
+use std::{
+    collections::HashMap,
+    io,
+    net::IpAddr,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+};
 
 /// Entries are revalidated after this long, and dropped when unused for twice it
 const REFRESH: i64 = 30 * 1_000_000_000;
@@ -186,6 +192,92 @@ fn parse_mac(text: &str) -> io::Result<MacAddress> {
     Ok(MacAddress(mac))
 }
 
+/// Sends the frames whose next hop is unresolved through the kernel's stack,
+/// which routes them and holds them until it has resolved the next hop, as it
+/// would for any socket
+pub struct Kernel {
+    v4: OwnedFd,
+    /// `None` when IPv6 is disabled on the host
+    v6: Option<OwnedFd>,
+}
+
+impl Kernel {
+    pub fn new() -> io::Result<Self> {
+        let v6 = raw_socket(libc::AF_INET6)
+            .inspect_err(|error| tracing::debug!(%error, "no raw IPv6 socket"))
+            .ok();
+        Ok(Self {
+            v4: raw_socket(libc::AF_INET)?,
+            v6,
+        })
+    }
+
+    /// Sends the IP packet in an ethernet frame, which must have a complete checksum
+    pub fn send(&self, frame: &[u8]) -> io::Result<()> {
+        let invalid = || io::Error::from(io::ErrorKind::InvalidInput);
+        let packet = frame.get(EthHdr::LEN..).ok_or_else(invalid)?;
+
+        // SAFETY: zeroed sockaddrs are valid
+        let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let (fd, len) = match packet.first().map(|byte| byte >> 4) {
+            Some(4) => {
+                // SAFETY: sockaddr_storage is large enough and aligned for any sockaddr
+                let sin = unsafe { &mut *(&raw mut addr).cast::<libc::sockaddr_in>() };
+                sin.sin_family = libc::AF_INET as _;
+                sin.sin_addr.s_addr =
+                    u32::from_ne_bytes(packet.get(16..20).ok_or_else(invalid)?.try_into().unwrap());
+                (&self.v4, std::mem::size_of::<libc::sockaddr_in>())
+            }
+            Some(6) => {
+                // SAFETY: sockaddr_storage is large enough and aligned for any sockaddr
+                let sin6 = unsafe { &mut *(&raw mut addr).cast::<libc::sockaddr_in6>() };
+                sin6.sin6_family = libc::AF_INET6 as _;
+                sin6.sin6_addr.s6_addr =
+                    packet.get(24..40).ok_or_else(invalid)?.try_into().unwrap();
+                let fd = self
+                    .v6
+                    .as_ref()
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::Unsupported))?;
+                (fd, std::mem::size_of::<libc::sockaddr_in6>())
+            }
+            _ => return Err(invalid()),
+        };
+
+        // SAFETY: syscall with a valid fd, buffer and address
+        let sent = unsafe {
+            libc::sendto(
+                fd.as_raw_fd(),
+                packet.as_ptr().cast(),
+                packet.len(),
+                libc::MSG_DONTWAIT,
+                (&raw const addr).cast(),
+                len as libc::socklen_t,
+            )
+        };
+        if sent < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+/// A raw socket the caller writes complete IP packets to
+fn raw_socket(family: i32) -> io::Result<OwnedFd> {
+    // SAFETY: syscall with valid arguments
+    let fd = unsafe {
+        libc::socket(
+            family,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            libc::IPPROTO_RAW,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the fd was just opened and is owned by nothing else
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 pub use netlink::Netlink;
 
 mod netlink {
@@ -355,14 +447,7 @@ mod netlink {
         /// never waits on the socket
         fn request(&mut self, kind: u16, flags: u16, body: &[u8]) -> io::Result<Vec<Vec<u8>>> {
             self.seq = self.seq.wrapping_add(1);
-
-            let mut msg = Vec::with_capacity(HEADER_LEN + body.len());
-            msg.extend_from_slice(&((HEADER_LEN + body.len()) as u32).to_ne_bytes());
-            msg.extend_from_slice(&kind.to_ne_bytes());
-            msg.extend_from_slice(&flags.to_ne_bytes());
-            msg.extend_from_slice(&self.seq.to_ne_bytes());
-            msg.extend_from_slice(&0u32.to_ne_bytes());
-            msg.extend_from_slice(body);
+            let msg = message(kind, flags, self.seq, body);
 
             // SAFETY: syscall with a valid fd and buffer
             let sent =
@@ -386,44 +471,65 @@ mod netlink {
                     return Err(io::Error::last_os_error());
                 }
 
-                let mut data = &self.buf[..received as usize];
-                let mut multi = false;
-                while data.len() >= HEADER_LEN {
-                    let len = u32::from_ne_bytes([data[0], data[1], data[2], data[3]]) as usize;
-                    let kind = u16::from_ne_bytes([data[4], data[5]]);
-                    let flags = u16::from_ne_bytes([data[6], data[7]]);
-                    let seq = u32::from_ne_bytes([data[8], data[9], data[10], data[11]]);
-                    if len < HEADER_LEN || len > data.len() {
-                        break;
-                    }
-                    let payload = &data[HEADER_LEN..len];
-                    data = &data[align(len).min(data.len())..];
-
-                    if seq != self.seq {
-                        continue;
-                    }
-                    multi = flags & libc::NLM_F_MULTI as u16 != 0;
-                    match kind as i32 {
-                        libc::NLMSG_DONE => return Ok(replies),
-                        libc::NLMSG_ERROR => {
-                            let errno = payload.get(..4).map_or(libc::EINVAL, |b| {
-                                i32::from_ne_bytes([b[0], b[1], b[2], b[3]])
-                            });
-                            return if errno == 0 {
-                                Ok(replies)
-                            } else {
-                                Err(io::Error::from_raw_os_error(-errno))
-                            };
-                        }
-                        _ => replies.push(payload.to_vec()),
-                    }
-                }
-
-                if !multi {
+                if collect(&self.buf[..received as usize], self.seq, &mut replies)? {
                     return Ok(replies);
                 }
             }
         }
+    }
+
+    fn message(kind: u16, flags: u16, seq: u32, body: &[u8]) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(HEADER_LEN + body.len());
+        msg.extend_from_slice(&((HEADER_LEN + body.len()) as u32).to_ne_bytes());
+        msg.extend_from_slice(&kind.to_ne_bytes());
+        msg.extend_from_slice(&flags.to_ne_bytes());
+        msg.extend_from_slice(&seq.to_ne_bytes());
+        msg.extend_from_slice(&0u32.to_ne_bytes());
+        msg.extend_from_slice(body);
+        msg
+    }
+
+    /// Adds the payloads in one received buffer that answer `seq` to `replies`,
+    /// returning whether the reply is complete. Messages left over from an
+    /// earlier request are skipped, so they can't be taken for this reply
+    fn collect(mut data: &[u8], seq: u32, replies: &mut Vec<Vec<u8>>) -> io::Result<bool> {
+        let mut complete = false;
+        while data.len() >= HEADER_LEN {
+            let len = u32::from_ne_bytes([data[0], data[1], data[2], data[3]]) as usize;
+            let kind = u16::from_ne_bytes([data[4], data[5]]);
+            let flags = u16::from_ne_bytes([data[6], data[7]]);
+            let msg_seq = u32::from_ne_bytes([data[8], data[9], data[10], data[11]]);
+            if len < HEADER_LEN || len > data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated netlink message",
+                ));
+            }
+            let payload = &data[HEADER_LEN..len];
+            data = &data[align(len).min(data.len())..];
+
+            if msg_seq != seq {
+                continue;
+            }
+            match kind as i32 {
+                libc::NLMSG_DONE => return Ok(true),
+                libc::NLMSG_ERROR => {
+                    let errno = payload.get(..4).map_or(-libc::EINVAL, |b| {
+                        i32::from_ne_bytes([b[0], b[1], b[2], b[3]])
+                    });
+                    return if errno == 0 {
+                        Ok(true)
+                    } else {
+                        Err(io::Error::from_raw_os_error(-errno))
+                    };
+                }
+                _ => {
+                    replies.push(payload.to_vec());
+                    complete |= flags & libc::NLM_F_MULTI as u16 == 0;
+                }
+            }
+        }
+        Ok(complete)
     }
 
     impl Tables for Netlink {
@@ -440,16 +546,17 @@ mod netlink {
         }
 
         fn neighbor(&mut self, ifindex: u32, ip: IpAddr) -> io::Result<Neighbor> {
-            let body = ndmsg(ip, ifindex, 0, 0);
-            let replies = self.request(
-                libc::RTM_GETNEIGH,
-                (libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16,
-                &body,
-            )?;
-            Ok(replies
-                .iter()
-                .find_map(|msg| parse_neighbor(msg, ifindex, ip))
-                .unwrap_or(Neighbor::Missing))
+            let mut body = ndmsg(ip, ifindex, 0, 0).to_vec();
+            push_attr(&mut body, libc::NDA_DST, &ip_bytes(ip));
+
+            match self.request(libc::RTM_GETNEIGH, libc::NLM_F_REQUEST as u16, &body) {
+                Ok(replies) => Ok(replies
+                    .iter()
+                    .find_map(|msg| parse_neighbor(msg, ifindex, ip))
+                    .unwrap_or(Neighbor::Missing)),
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(Neighbor::Missing),
+                Err(error) => Err(error),
+            }
         }
 
         fn resolve(&mut self, ifindex: u32, ip: IpAddr) -> io::Result<()> {
@@ -579,6 +686,66 @@ mod netlink {
                 ),
                 None
             );
+        }
+
+        fn error(seq: u32, errno: i32) -> Vec<u8> {
+            message(libc::NLMSG_ERROR as u16, 0, seq, &errno.to_ne_bytes())
+        }
+
+        #[test]
+        fn single_reply() {
+            let mut replies = Vec::new();
+            let buf = message(libc::RTM_NEWROUTE, 0, 7, &[1, 2, 3, 4]);
+            assert!(collect(&buf, 7, &mut replies).unwrap());
+            assert_eq!(replies, [vec![1, 2, 3, 4]]);
+        }
+
+        #[test]
+        fn multipart_reply_ends_with_done() {
+            let multi = libc::NLM_F_MULTI as u16;
+            let mut replies = Vec::new();
+
+            let mut buf = message(libc::RTM_NEWNEIGH, multi, 7, &[1; 4]);
+            buf.extend(message(libc::RTM_NEWNEIGH, multi, 7, &[2; 4]));
+            assert!(!collect(&buf, 7, &mut replies).unwrap());
+
+            let mut buf = message(libc::RTM_NEWNEIGH, multi, 7, &[3; 4]);
+            buf.extend(message(libc::NLMSG_DONE as u16, multi, 7, &[0; 4]));
+            assert!(collect(&buf, 7, &mut replies).unwrap());
+            assert_eq!(replies, [[1; 4], [2; 4], [3; 4]]);
+        }
+
+        #[test]
+        fn acks_and_errors() {
+            let mut replies = Vec::new();
+            assert!(collect(&error(7, 0), 7, &mut replies).unwrap());
+            assert!(replies.is_empty());
+
+            let err = collect(&error(7, -libc::ENOENT), 7, &mut replies).unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+        }
+
+        #[test]
+        fn leftovers_from_an_earlier_request_are_skipped() {
+            let mut replies = Vec::new();
+
+            // A buffer holding only an earlier reply leaves this one incomplete
+            let stale = message(libc::RTM_NEWROUTE, 0, 6, &[6; 4]);
+            assert!(!collect(&stale, 7, &mut replies).unwrap());
+            assert!(!collect(&error(6, -libc::ENOENT), 7, &mut replies).unwrap());
+            assert!(replies.is_empty());
+
+            let mut buf = stale;
+            buf.extend(message(libc::RTM_NEWROUTE, 0, 7, &[7; 4]));
+            assert!(collect(&buf, 7, &mut replies).unwrap());
+            assert_eq!(replies, [[7; 4]]);
+        }
+
+        #[test]
+        fn truncated_messages_are_rejected() {
+            let mut buf = message(libc::RTM_NEWROUTE, 0, 7, &[1; 8]);
+            buf.truncate(HEADER_LEN + 4);
+            assert!(collect(&buf, 7, &mut Vec::new()).is_err());
         }
     }
 }

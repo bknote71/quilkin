@@ -723,6 +723,16 @@ fn io_loop(
             None
         }
     };
+    let kernel = match next_hop::Kernel::new() {
+        Ok(kernel) => Some(std::rc::Rc::new(kernel)),
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "failed to open a raw socket, frames with an unresolved next hop are sent back the way they were received"
+            );
+            None
+        }
+    };
 
     let mut state = process::State {
         external_port,
@@ -734,6 +744,7 @@ fn io_loop(
         local_ipv6,
         local_mac,
         next_hops,
+        kernel,
         last_receive: UtcTimestamp::now(),
     };
 

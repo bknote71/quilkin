@@ -1045,7 +1045,7 @@ pub(crate) fn xdp_next_hop_unresolved() -> &'static IntCounter {
         prometheus::register_int_counter_with_registry! {
             prometheus::opts! {
                 "quilkin_xdp_next_hop_unresolved_total",
-                "The number of XDP frames sent back the way they were received because their next hop was not resolved yet",
+                "The number of XDP frames sent through the kernel's network stack because their next hop was not resolved yet",
             },
             registry(),
         }

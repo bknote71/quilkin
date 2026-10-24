@@ -20,6 +20,7 @@ use quilkin_xdp::xdp::{
 use std::{
     collections::hash_map::Entry,
     net::{IpAddr, SocketAddr},
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicU16, Ordering},
@@ -217,27 +218,50 @@ pub struct State {
     pub local_mac: MacAddress,
     /// `None` falls back to replying along the path a frame was received on
     pub next_hops: Option<next_hop::NextHopCache<next_hop::Netlink>>,
+    /// `None` sends frames with an unresolved next hop back the way the
+    /// received one came, which is only right when that neighbor forwards both ways
+    pub kernel: Option<Rc<next_hop::Kernel>>,
     pub last_receive: UtcTimestamp,
 }
 
-impl State {
-    /// Until the next hop is resolved the frame is sent back the way the
-    /// received one came, which is only right when that neighbor forwards both ways
+/// How a frame leaves the proxy
+enum Egress {
+    /// Out of the NIC, addressed to the next hop
+    Nic,
+    /// Through the kernel's stack, which resolves the next hop itself
+    Kernel(Rc<next_hop::Kernel>),
+}
+
+impl Egress {
+    /// The kernel doesn't offload the checksum of a packet written to a raw
+    /// socket, so the data is always checksummed for it
     #[inline]
-    fn eth(&mut self, received: &EthHdr, destination: IpAddr) -> EthHdr {
+    fn data_checksum(&self, data: &[u8], checksum: csum::DataChecksum) -> csum::DataChecksum {
+        match self {
+            Self::Nic => checksum,
+            Self::Kernel(_) => csum::DataChecksum::calculate(data),
+        }
+    }
+}
+
+impl State {
+    #[inline]
+    fn egress(&mut self, received: &EthHdr, destination: IpAddr) -> (EthHdr, Egress) {
         let next_hop = self
             .next_hops
             .as_mut()
             .and_then(|cache| cache.lookup(destination, self.last_receive.unix_nanos()));
         let Some(mac) = next_hop else {
             metrics::xdp_next_hop_unresolved().inc();
-            return received.swapped();
+            let egress = self.kernel.clone().map_or(Egress::Nic, Egress::Kernel);
+            return (received.swapped(), egress);
         };
-        EthHdr {
+        let eth = EthHdr {
             destination: mac,
             source: self.local_mac,
             ether_type: received.ether_type,
-        }
+        };
+        (eth, Egress::Nic)
     }
 
     /// Retrieves or creates a session, ie a mapping of a server endpoint + port
@@ -720,6 +744,7 @@ pub fn process_packets(
 fn push_packet(
     direction: metrics::Direction,
     packet: Packet,
+    egress: Egress,
     asn: AsnInfo<'_>,
     cluster: &str,
     data_length: usize,
@@ -727,22 +752,34 @@ fn push_packet(
     tx_slab: &mut HeapSlab,
     umem: &mut Umem,
 ) {
-    match res {
-        Ok(()) => {
+    if let Err(err) = res {
+        metrics::errors_total(direction, err.discriminant(), &metrics::EMPTY).inc();
+        metrics::packets_dropped(direction, metrics::DropReason::SocketError).inc();
+        umem.free_packet(packet);
+        return;
+    }
+
+    match egress {
+        Egress::Nic => {
             if let Some(packet) = tx_slab.push_front(packet) {
                 metrics::packets_dropped(direction, metrics::DropReason::QueueFull).inc();
                 umem.free_packet(packet);
-            } else {
-                metrics::packets_total(direction, &asn, cluster).inc();
-                metrics::bytes_total(direction, &asn, cluster).inc_by(data_length as u64);
+                return;
             }
         }
-        Err(err) => {
-            metrics::errors_total(direction, err.discriminant(), &metrics::EMPTY).inc();
-            metrics::packets_dropped(direction, metrics::DropReason::SocketError).inc();
+        Egress::Kernel(kernel) => {
+            let sent = kernel.send(&packet);
             umem.free_packet(packet);
+            if let Err(error) = sent {
+                tracing::debug!(%error, "failed to send a frame through the kernel");
+                metrics::packets_dropped(direction, metrics::DropReason::SocketError).inc();
+                return;
+            }
         }
     }
+
+    metrics::packets_total(direction, &asn, cluster).inc();
+    metrics::bytes_total(direction, &asn, cluster).inc_by(data_length as u64);
 }
 
 #[inline]
@@ -791,7 +828,8 @@ fn process_client_packet(
                 continue;
             };
             let cluster = daddr.cluster_label();
-            let eth = state.eth(&received_eth, dest_addr.ip());
+            let (eth, egress) = state.egress(&received_eth, dest_addr.ip());
+            let data_checksum = egress.data_checksum(data, data_checksum);
             let (source, asn, ips) = state.session(source_addr, dest_addr, cluster);
 
             let mut headers = UdpHeaders {
@@ -819,6 +857,7 @@ fn process_client_packet(
             push_packet(
                 metrics::Direction::Read,
                 new_packet,
+                egress,
                 asn,
                 cluster,
                 data_length,
@@ -833,7 +872,8 @@ fn process_client_packet(
     let Ok(dest_addr) = dest_addr.address.to_socket_addr() else {
         return Ok(Some(packet.buffer));
     };
-    let eth = state.eth(&received_eth, dest_addr.ip());
+    let (eth, egress) = state.egress(&received_eth, dest_addr.ip());
+    let data_checksum = egress.data_checksum(data, data_checksum);
     let (source, asn, ips) = state.session(source_addr, dest_addr, cluster);
 
     let mut headers = UdpHeaders {
@@ -855,6 +895,7 @@ fn process_client_packet(
     push_packet(
         metrics::Direction::Read,
         packet.buffer,
+        egress,
         asn,
         cluster,
         data_length,
@@ -886,7 +927,7 @@ fn process_server_packet(
         return Ok(Some(packet.buffer));
     };
 
-    let eth = state.eth(&packet.headers.eth, client_addr.ip());
+    let (eth, egress) = state.egress(&packet.headers.eth, client_addr.ip());
     let asn = state
         .addr_to_asn
         .get(&client_addr.ip(), state.last_receive.unix_nanos())
@@ -915,14 +956,22 @@ fn process_server_packet(
         data: packet.headers.data,
     };
 
-    let res = modify_packet_headers(&packet.headers, &mut headers, &mut packet.buffer);
-    if res.is_ok() {
-        let _ = packet.buffer.calc_udp_checksum();
-    }
+    let res = if let Egress::Kernel(_) = egress {
+        let data = &packet.buffer[packet.headers.data];
+        headers.calc_checksum(csum::DataChecksum::calculate(data));
+        modify_packet_headers(&packet.headers, &mut headers, &mut packet.buffer)
+    } else {
+        let res = modify_packet_headers(&packet.headers, &mut headers, &mut packet.buffer);
+        if res.is_ok() {
+            let _ = packet.buffer.calc_udp_checksum();
+        }
+        res
+    };
 
     push_packet(
         metrics::Direction::Write,
         packet.buffer,
+        egress,
         asn,
         &cluster,
         packet.headers.data_length(),
