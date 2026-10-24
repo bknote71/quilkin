@@ -214,33 +214,29 @@ impl Kernel {
 
     /// Sends the IP packet in an ethernet frame, which must have a complete checksum
     pub fn send(&self, frame: &[u8]) -> io::Result<()> {
-        let invalid = || io::Error::from(io::ErrorKind::InvalidInput);
-        let packet = frame.get(EthHdr::LEN..).ok_or_else(invalid)?;
+        let (packet, destination) = ip_packet(frame)?;
 
         // SAFETY: zeroed sockaddrs are valid
         let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-        let (fd, len) = match packet.first().map(|byte| byte >> 4) {
-            Some(4) => {
+        let (fd, len) = match destination {
+            IpAddr::V4(ip) => {
                 // SAFETY: sockaddr_storage is large enough and aligned for any sockaddr
                 let sin = unsafe { &mut *(&raw mut addr).cast::<libc::sockaddr_in>() };
                 sin.sin_family = libc::AF_INET as _;
-                sin.sin_addr.s_addr =
-                    u32::from_ne_bytes(packet.get(16..20).ok_or_else(invalid)?.try_into().unwrap());
+                sin.sin_addr.s_addr = u32::from_ne_bytes(ip.octets());
                 (&self.v4, std::mem::size_of::<libc::sockaddr_in>())
             }
-            Some(6) => {
+            IpAddr::V6(ip) => {
                 // SAFETY: sockaddr_storage is large enough and aligned for any sockaddr
                 let sin6 = unsafe { &mut *(&raw mut addr).cast::<libc::sockaddr_in6>() };
                 sin6.sin6_family = libc::AF_INET6 as _;
-                sin6.sin6_addr.s6_addr =
-                    packet.get(24..40).ok_or_else(invalid)?.try_into().unwrap();
+                sin6.sin6_addr.s6_addr = ip.octets();
                 let fd = self
                     .v6
                     .as_ref()
                     .ok_or_else(|| io::Error::from(io::ErrorKind::Unsupported))?;
                 (fd, std::mem::size_of::<libc::sockaddr_in6>())
             }
-            _ => return Err(invalid()),
         };
 
         // SAFETY: syscall with a valid fd, buffer and address
@@ -259,6 +255,22 @@ impl Kernel {
         }
         Ok(())
     }
+}
+
+/// The IP packet in an ethernet frame and its destination
+fn ip_packet(frame: &[u8]) -> io::Result<(&[u8], IpAddr)> {
+    let invalid = || io::Error::from(io::ErrorKind::InvalidInput);
+    let packet = frame.get(EthHdr::LEN..).ok_or_else(invalid)?;
+    let destination = match packet.first().map(|byte| byte >> 4) {
+        Some(4) => {
+            IpAddr::from(<[u8; 4]>::try_from(packet.get(16..20).ok_or_else(invalid)?).unwrap())
+        }
+        Some(6) => {
+            IpAddr::from(<[u8; 16]>::try_from(packet.get(24..40).ok_or_else(invalid)?).unwrap())
+        }
+        _ => return Err(invalid()),
+    };
+    Ok((packet, destination))
 }
 
 /// A raw socket the caller writes complete IP packets to
@@ -931,5 +943,29 @@ mod tests {
         assert!(parse_mac("0e:ff:f4:8b:7d").is_err());
         assert!(parse_mac("0e:ff:f4:8b:7d:73:00").is_err());
         assert!(parse_mac("zz:ff:f4:8b:7d:73").is_err());
+    }
+
+    #[test]
+    fn kernel_frames_are_sent_from_the_ip_header() {
+        let frame = |ip: &[u8]| [&[0u8; EthHdr::LEN][..], ip].concat();
+
+        let mut v4 = [0u8; 28];
+        v4[0] = 0x45;
+        v4[16..20].copy_from_slice(&[10, 0, 2, 10]);
+        let v4 = frame(&v4);
+        let (packet, dst) = ip_packet(&v4).unwrap();
+        assert_eq!(packet.len(), 28);
+        assert_eq!(dst, IpAddr::from([10, 0, 2, 10]));
+
+        let client = std::net::Ipv6Addr::new(0xfd00, 2, 0, 0, 0, 0, 0, 0x10);
+        let mut v6 = [0u8; 48];
+        v6[0] = 0x60;
+        v6[24..40].copy_from_slice(&client.octets());
+        let v6 = frame(&v6);
+        assert_eq!(ip_packet(&v6).unwrap().1, IpAddr::V6(client));
+
+        assert!(ip_packet(&[0; EthHdr::LEN]).is_err());
+        assert!(ip_packet(&frame(&[0x45; 12])).is_err());
+        assert!(ip_packet(&frame(&[0x10; 40])).is_err());
     }
 }
